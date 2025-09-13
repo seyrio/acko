@@ -3,7 +3,7 @@ import redis
 r = redis.Redis(host='localhost', port=6379, db=0)
 
 # Get all messages from the stream
-messages = r.xrange('transcription_stream', count=10)
+messages = r.xrange('transcription_stream', count=100)
 
 for msg_id, fields in messages:
     text = fields[b'text'].decode()

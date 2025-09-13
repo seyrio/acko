@@ -1,28 +1,22 @@
-#!/usr/bin/env python3
-
+import asyncio
 import whisper
 import torch
 import numpy as np
 import pyaudio
 import warnings
-import tempfile
-import wave
-import os
 import time
-import asyncio
-
+import redis  # synchronous Redis client
+import redis.asyncio as redis_async  # async Redis client for FastAPI WebSocket
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
-import redis.asyncio as redis
-import uvicorn
 import threading
 
-# ----------- Whisper Recorder Class -----------
-
+# ----------------------------
+# Whisper Recorder with Redis
+# ----------------------------
 class FixedWhisperRecorder:
-    def __init__(self, model_name="base"):
+    def __init__(self, model_name="base", redis_client=None):
         print(f"Loading Whisper model: {model_name}")
-        
         torch.set_default_dtype(torch.float32)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
@@ -32,14 +26,12 @@ class FixedWhisperRecorder:
             self.model.encoder = self.model.encoder.float()
         if hasattr(self.model, 'decoder'):
             self.model.decoder = self.model.decoder.float()
-
-        self.redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+        self.redis_client = redis_client
 
     def record_audio_fixed(self, duration=5, sample_rate=16000):
         print(f"Recording for {duration} seconds at {sample_rate} Hz...")
         audio = pyaudio.PyAudio()
         device_index = None
-
         for i in range(audio.get_device_count()):
             info = audio.get_device_info_by_index(i)
             if info['maxInputChannels'] > 0:
@@ -58,10 +50,8 @@ class FixedWhisperRecorder:
                     break
                 except:
                     continue
-        
         if device_index is None:
             print("Using default input device")
-
         stream_config = {
             'format': pyaudio.paInt16,
             'channels': 1,
@@ -71,13 +61,11 @@ class FixedWhisperRecorder:
         }
         if device_index is not None:
             stream_config['input_device_index'] = device_index
-        
         stream = audio.open(**stream_config)
         frames = []
         frames_to_record = int(sample_rate / 1024 * duration)
         print("Recording... Speak now!")
         max_level = 0
-
         for i in range(frames_to_record):
             data = stream.read(1024, exception_on_overflow=False)
             frames.append(data)
@@ -87,16 +75,12 @@ class FixedWhisperRecorder:
             if i % 10 == 0:
                 progress = (i / frames_to_record) * 100
                 print(f"\rProgress: {progress:.0f}% | Max level: {max_level}", end="", flush=True)
-
         print(f"\nRecording complete! Max level: {max_level}")
-
         stream.stop_stream()
         stream.close()
         audio.terminate()
-
         if max_level < 100:
             print(f"⚠️  Audio level is very low ({max_level}). Try speaking louder.")
-
         audio_data = b''.join(frames)
         audio_array = np.frombuffer(audio_data, dtype=np.int16)
         audio_float32 = audio_array.astype(np.float32) / 32768.0
@@ -106,13 +90,12 @@ class FixedWhisperRecorder:
         if audio_array is None or len(audio_array) == 0:
             print("Empty audio array")
             return None
-        
         try:
+            print("Transcribing with dtype fixes...")
             if audio_array.dtype != np.float32:
                 audio_array = audio_array.astype(np.float32)
             if np.max(np.abs(audio_array)) > 1.0:
                 audio_array = audio_array / np.max(np.abs(audio_array))
-            
             options = {
                 'fp16': False,
                 'language': language if language else None,
@@ -123,12 +106,13 @@ class FixedWhisperRecorder:
                 warnings.simplefilter("ignore", UserWarning)
                 result = self.model.transcribe(audio_array, **options)
             return result
-            
         except Exception as e:
             print(f"Transcription failed: {e}")
             return None
 
     def record_and_transcribe_fixed(self, duration=5, language="en"):
+        print("🎙️  Starting recording and transcription with dtype fixes")
+        print("=" * 60)
         audio_array = self.record_audio_fixed(duration)
         if audio_array is None:
             print("❌ Recording failed")
@@ -137,46 +121,74 @@ class FixedWhisperRecorder:
         if result and result.get('text', '').strip():
             text = result['text']
             print(f"✅ Success: '{text}'")
-            self.redis_client.xadd(
-                name="transcription_stream",
-                fields={
-                    "text": text,
-                    "timestamp": str(time.time())
-                }
-            )
-            print("📤 Transcription sent to Redis stream.")
+            if self.redis_client:
+                try:
+                    self.redis_client.xadd(
+                        name="transcription_stream",
+                        fields={
+                            "text": text,
+                            "timestamp": str(time.time())
+                        },
+                        maxlen=1000,
+                        approximate=True
+                    )
+                    print("📤 Transcription sent to Redis stream.")
+                except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError) as e:
+                    print(f"Redis connection error: {e}. Attempting to reconnect...")
+                    try:
+                        self.redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+                        self.redis_client.xadd(
+                            name="transcription_stream",
+                            fields={
+                                "text": text,
+                                "timestamp": str(time.time())
+                            },
+                            maxlen=1000,
+                            approximate=True
+                        )
+                        print("📤 Transcription sent to Redis stream after reconnect.")
+                    except Exception as e2:
+                        print(f"Failed to push to Redis after reconnect: {e2}")
+                except Exception as e:
+                    print(f"Failed to push to Redis: {e}")
             return result
         else:
             print("❌ Transcription failed or returned empty text")
             return None
 
-# ----------- FastAPI Webserver -----------
-
+# ----------------------------
+# FastAPI + WebSocket + Async Redis
+# ----------------------------
 app = FastAPI()
-redis_client = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
-STREAM_KEY = "transcription_stream"
+
+redis_client_async = redis_async.Redis(host='localhost', port=6379, db=0, decode_responses=True)
 
 html = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Live Transcriptions from Redis Stream</title>
+    <title>Live Transcriptions</title>
 </head>
 <body>
-    <h1>Live Transcriptions from Redis Stream</h1>
-    <ul id="messages"></ul>
+    <h2>Live Redis Transcriptions</h2>
+    <ul id="transcriptions"></ul>
 
     <script>
-        let ws = new WebSocket("ws://" + location.host + "/ws");
+        const ws = new WebSocket("ws://localhost:8001/ws");
+        const ul = document.getElementById("transcriptions");
+
         ws.onmessage = function(event) {
             const data = JSON.parse(event.data);
-            const messages = document.getElementById("messages");
             const li = document.createElement("li");
-            li.textContent = `${data.timestamp}: ${data.text}`;
-            messages.appendChild(li);
+            li.textContent = `[${new Date(parseFloat(data.timestamp) * 1000).toLocaleTimeString()}] ${data.text}`;
+            ul.appendChild(li);
         };
-        ws.onopen = () => console.log("WebSocket connected");
-        ws.onclose = () => console.log("WebSocket disconnected");
+
+        ws.onclose = () => {
+            const li = document.createElement("li");
+            li.textContent = "WebSocket connection closed.";
+            ul.appendChild(li);
+        };
     </script>
 </body>
 </html>
@@ -189,48 +201,51 @@ async def get():
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    last_id = "0-0"  # Start from beginning, change to "$" for only new messages
-
+    last_id = '0-0'
     try:
         while True:
-            streams = await redis_client.xread({STREAM_KEY: last_id}, block=0, count=10)
+            streams = await redis_client_async.xread({'transcription_stream': last_id}, block=5, count=1)
             if streams:
-                for stream_key, messages in streams:
-                    for message_id, fields in messages:
-                        text = fields.get("text", "")
-                        timestamp = fields.get("timestamp", "")
-                        await websocket.send_json({"text": text, "timestamp": timestamp})
+                for stream_name, messages in streams:
+                    for message_id, message_data in messages:
+                        await websocket.send_json(message_data)
                         last_id = message_id
+            else:
+                await asyncio.sleep(0.1)
     except WebSocketDisconnect:
-        print("Client disconnected")
-    except Exception as e:
-        print(f"WebSocket error: {e}")
-    finally:
-        await websocket.close()
+        print("WebSocket disconnected")
 
-# ----------- Run recorder in background thread -----------
-
+# ----------------------------
+# Run Whisper Recorder in background thread
+# ----------------------------
 def run_recorder():
-    fix_pytorch_whisper_compatibility()
-    recorder = FixedWhisperRecorder(model_name="base")
+    redis_client_sync = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+
     try:
-        while True:
+        redis_client_sync.ping()
+        print("✅ Connected to Redis successfully!")
+    except Exception as e:
+        print(f"❌ Redis connection failed: {e}")
+        return
+
+    recorder = FixedWhisperRecorder(model_name="base", redis_client=redis_client_sync)
+
+    print("Press Ctrl+C to stop recording and transcribing.")
+    while True:
+        try:
             recorder.record_and_transcribe_fixed(duration=5, language="en")
             print("-" * 50)
-    except KeyboardInterrupt:
-        print("\n🛑 Recorder stopped by user.")
+        except Exception as e:
+            print(f"❌ Exception in recorder loop: {e}")
+            time.sleep(1)
 
-def fix_pytorch_whisper_compatibility():
-    torch.set_default_dtype(torch.float32)
-    os.environ['TORCH_DEFAULT_DTYPE'] = 'float32'
-    os.environ['WHISPER_NO_FP16'] = '1'
-
-# ----------- Main Entrypoint -----------
+# ----------------------------
+# Main entry: run FastAPI + recorder thread
+# ----------------------------
+import uvicorn
 
 if __name__ == "__main__":
-    # Start recorder in background thread
     recorder_thread = threading.Thread(target=run_recorder, daemon=True)
     recorder_thread.start()
 
-    # Start FastAPI app with Uvicorn
     uvicorn.run("whisper_redis_fastapi:app", host="127.0.0.1", port=8001, reload=False)
