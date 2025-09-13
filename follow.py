@@ -438,26 +438,34 @@ class RAGFollowUpGenerator:
     
     def generate_followup_questions(self, conversation: str, max_questions: int = 3) -> List[FollowUpQuestion]:
         """Generate follow-up questions using RAG"""
+        logger.info(f"Starting question generation for conversation: '{conversation[:100]}...'")
+        
         if not conversation.strip():
-            return []
+            logger.warning("Empty conversation provided, generating fallback questions")
+            return self._generate_fallback_questions({})
         
         # Extract medical entities from conversation
         entities = self.extract_medical_entities(conversation)
+        logger.info(f"Extracted entities: {entities}")
         
         # Generate search query
         search_query = self.generate_context_query(conversation, entities)
+        logger.info(f"Generated search query: '{search_query[:100]}...'")
         
         # Retrieve relevant documents
         retrieved_docs = self.retriever.retrieve(search_query, top_k=5)
+        logger.info(f"Retrieved {len(retrieved_docs)} documents from RAG")
         
         if not retrieved_docs:
-            logger.warning("No relevant documents found for query")
+            logger.warning("No relevant documents found for query, using fallback questions")
             return self._generate_fallback_questions(entities)
         
         # Generate questions based on retrieved knowledge
         questions = []
         
         for doc, relevance_score in retrieved_docs[:max_questions]:
+            logger.info(f"Processing document '{doc.id}' with relevance score {relevance_score}")
+            
             # Extract question templates from document metadata
             if 'questions' in doc.metadata:
                 doc_questions = doc.metadata['questions']
@@ -470,20 +478,31 @@ class RAGFollowUpGenerator:
                             category=doc.metadata.get('category', 'general'),
                             priority=doc.metadata.get('priority', 2)
                         ))
+                        logger.info(f"Added metadata question: '{q}'")
             
             # Generate questions based on document content
             content_questions = self._extract_questions_from_content(
                 doc.content, entities, relevance_score, doc.id
             )
             questions.extend(content_questions)
+            logger.info(f"Added {len(content_questions)} content-based questions")
+        
+        # If no questions generated from RAG, use fallback
+        if not questions:
+            logger.warning("No questions generated from RAG documents, using fallback")
+            return self._generate_fallback_questions(entities)
         
         # Remove duplicates and rank by relevance
         unique_questions = self._deduplicate_questions(questions)
+        logger.info(f"After deduplication: {len(unique_questions)} unique questions")
         
         # Sort by priority and relevance
         unique_questions.sort(key=lambda q: (q.priority, -q.relevance_score))
         
-        return unique_questions[:max_questions]
+        final_questions = unique_questions[:max_questions]
+        logger.info(f"Returning {len(final_questions)} final questions")
+        
+        return final_questions
     
     def _extract_questions_from_content(self, content: str, entities: Dict, 
                                       relevance_score: float, doc_id: str) -> List[FollowUpQuestion]:
@@ -542,7 +561,31 @@ class RAGFollowUpGenerator:
     
     def _generate_fallback_questions(self, entities: Dict) -> List[FollowUpQuestion]:
         """Generate basic questions when RAG retrieval fails"""
+        logger.info("Generating fallback questions...")
         fallback_questions = []
+        
+        # Entity-specific questions if we have entities
+        if entities.get('symptoms'):
+            for symptom in entities['symptoms'][:2]:  # Max 2 symptom questions
+                fallback_questions.append(FollowUpQuestion(
+                    question=f"Can you tell me more about your {symptom}? When did it start?",
+                    relevance_score=0.7,
+                    source_docs=['entity_fallback'],
+                    category='symptom_specific',
+                    priority=1
+                ))
+                logger.info(f"Added entity-specific question for symptom: {symptom}")
+                
+        if entities.get('conditions'):
+            for condition in entities['conditions'][:1]:  # Max 1 condition question
+                fallback_questions.append(FollowUpQuestion(
+                    question=f"Are you currently receiving any treatment for {condition}?",
+                    relevance_score=0.7,
+                    source_docs=['entity_fallback'],
+                    category='condition_specific',
+                    priority=1
+                ))
+                logger.info(f"Added entity-specific question for condition: {condition}")
         
         # Generic medical questions
         generic_questions = [
@@ -553,15 +596,19 @@ class RAGFollowUpGenerator:
             "How are these symptoms affecting your daily activities?"
         ]
         
-        for i, q in enumerate(generic_questions[:3]):
+        # Add generic questions if we don't have enough entity-specific ones
+        needed_questions = max(3 - len(fallback_questions), 0)
+        for i, q in enumerate(generic_questions[:needed_questions]):
             fallback_questions.append(FollowUpQuestion(
                 question=q,
                 relevance_score=0.5,
-                source_docs=['fallback'],
+                source_docs=['generic_fallback'],
                 category='generic',
-                priority=3
+                priority=2
             ))
+            logger.info(f"Added generic question: {q}")
         
+        logger.info(f"Generated {len(fallback_questions)} fallback questions total")
         return fallback_questions
     
     def save_session_context(self, session_id: str, context: Dict):
@@ -591,67 +638,94 @@ def main():
                        help='Maximum number of questions to generate')
     parser.add_argument('--embedding-model', default='all-MiniLM-L6-v2',
                        help='Sentence transformer model name')
+    parser.add_argument('--debug', action='store_true', help='Enable debug output')
+    parser.add_argument('--test-conversation', help='Use provided test conversation instead of Redis')
     
     args = parser.parse_args()
+    
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
     
     try:
         # Initialize RAG system
         logger.info("Initializing Medical RAG system...")
         retriever = MedicalRAGRetriever(embedding_model_name=args.embedding_model)
         
-        # Test Redis connection first
-        logger.info(f"Connecting to Redis at {args.redis_host}:{args.redis_port}")
-        redis_client = redis.Redis(host=args.redis_host, port=args.redis_port, decode_responses=True)
-        
+        # Test Redis connection first (but don't fail if it doesn't work)
+        redis_client = None
         try:
+            logger.info(f"Connecting to Redis at {args.redis_host}:{args.redis_port}")
+            redis_client = redis.Redis(host=args.redis_host, port=args.redis_port, decode_responses=True)
             redis_client.ping()
             logger.info("Redis connection successful")
         except redis.ConnectionError as e:
-            logger.error(f"Cannot connect to Redis: {e}")
-            return
+            logger.warning(f"Cannot connect to Redis: {e}")
+            if not args.test_conversation and not args.docs_file:
+                logger.warning("No Redis, no test conversation, and no docs file - will use fallback methods only")
         
         # Load documents from file if provided
         if args.docs_file and Path(args.docs_file).exists():
             logger.info(f"Loading documents from file: {args.docs_file}")
             retriever.load_documents_from_file(args.docs_file)
+        elif args.docs_file:
+            logger.error(f"Documents file not found: {args.docs_file}")
         
         # Load from Redis if available
-        logger.info(f"Attempting to load documents from Redis pattern: {args.docs_redis_pattern}")
-        retriever.load_documents_from_redis(redis_client, args.docs_redis_pattern)
+        if redis_client:
+            logger.info(f"Attempting to load documents from Redis pattern: {args.docs_redis_pattern}")
+            retriever.load_documents_from_redis(redis_client, args.docs_redis_pattern)
         
         # Check if we have any documents loaded
         if not retriever.documents:
             logger.warning("No documents loaded. Consider providing --docs-file or ensuring Redis has data.")
             print("Warning: No medical documents loaded. Questions will be generated using fallback methods.")
+            print("\nTo test with sample documents, create a file 'sample_docs.json' with medical content.")
+        else:
+            logger.info(f"Loaded {len(retriever.documents)} documents successfully")
+            print(f"Successfully loaded {len(retriever.documents)} documents for RAG")
+            if args.debug:
+                for i, doc in enumerate(retriever.documents[:3]):  # Show first 3 docs
+                    print(f"  Document {i+1}: {doc.id} - {doc.content[:100]}...")
         
         # Initialize question generator
         generator = RAGFollowUpGenerator(retriever)
-        generator.connect_redis(host=args.redis_host, port=args.redis_port)
+        if redis_client:
+            try:
+                generator.connect_redis(host=args.redis_host, port=args.redis_port)
+            except:
+                logger.warning("Could not connect question generator to Redis, continuing without it")
         
-        # Check if stream exists
-        if not redis_client.exists(args.stream):
-            logger.warning(f"Redis stream '{args.stream}' does not exist")
-            print(f"Warning: Redis stream '{args.stream}' not found.")
-            
-            # Optionally create a sample conversation for testing
-            sample_conversation = """[patient]: I've been having chest pain for the past few days
-[doctor]: Can you describe the pain? Is it sharp or dull?
-[patient]: It's more of a dull ache, especially when I breathe deeply
-[doctor]: Have you experienced any shortness of breath?"""
-            
-            print("Using sample conversation for demonstration:")
-            print(sample_conversation)
-            conversation = sample_conversation
-        else:
+        # Determine conversation source
+        if args.test_conversation:
+            conversation = args.test_conversation
+            print("Using provided test conversation")
+        elif redis_client and redis_client.exists(args.stream):
             # Read conversation from Redis
             print("=== Reading conversation from Redis ===")
             conversation = generator.read_conversation_from_redis(args.stream)
+        else:
+            if redis_client:
+                logger.warning(f"Redis stream '{args.stream}' does not exist")
+                print(f"Warning: Redis stream '{args.stream}' not found.")
+            
+            # Use sample conversation for testing
+            sample_conversation = """[patient]: I've been having chest pain for the past few days
+[doctor]: Can you describe the pain? Is it sharp or dull?
+[patient]: It's more of a dull ache, especially when I breathe deeply
+[doctor]: Have you experienced any shortness of breath?
+[patient]: No, but I do feel tired more easily than usual"""
+            
+            print("Using sample conversation for demonstration:")
+            conversation = sample_conversation
         
         if not conversation:
-            print("No conversation data available.")
-            return
+            logger.warning("No conversation data available - creating sample")
+            conversation = """[patient]: I have been experiencing headaches and dizziness lately
+[doctor]: How long have you been having these symptoms?
+[patient]: About two weeks now, they seem to be getting worse"""
+            print("Using fallback sample conversation:")
         
-        print("=== Current Conversation ===")
+        print("\n=== Current Conversation ===")
         print(conversation)
         print("=" * 50)
         
@@ -675,6 +749,11 @@ def main():
                 print()
         else:
             print("No follow-up questions could be generated.")
+            print("\nTroubleshooting tips:")
+            print("1. Make sure you have medical documents loaded (--docs-file)")
+            print("2. Check that your conversation contains medical terms")
+            print("3. Try running with --debug flag for more information")
+            print("4. Test with: --test-conversation 'I have chest pain and headaches'")
         
     except KeyboardInterrupt:
         print("\nProcess interrupted by user.")
